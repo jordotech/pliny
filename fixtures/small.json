@@ -1,0 +1,84 @@
+{
+  "format_version": "1.2",
+  "resource_changes": [
+    {
+      "address": "aws_dynamodb_table.users",
+      "type": "aws_dynamodb_table",
+      "name": "users",
+      "change": {
+        "actions": ["create"],
+        "before": null,
+        "after": {
+          "name": "users",
+          "billing_mode": "PAY_PER_REQUEST",
+          "hash_key": "id"
+        }
+      }
+    },
+    {
+      "address": "aws_dynamodb_table.orders",
+      "type": "aws_dynamodb_table",
+      "name": "orders",
+      "change": {
+        "actions": ["create"],
+        "before": null,
+        "after": {
+          "name": "orders",
+          "billing_mode": "PAY_PER_REQUEST",
+          "hash_key": "order_id"
+        }
+      }
+    },
+    {
+      "address": "aws_security_group.web",
+      "type": "aws_security_group",
+      "name": "web",
+      "change": {
+        "actions": ["update"],
+        "before": {
+          "name": "web",
+          "description": "web servers",
+          "ingress": [{"from_port": 443, "to_port": 443, "cidr_blocks": ["10.0.0.0/8"]}]
+        },
+        "after": {
+          "name": "web",
+          "description": "web servers",
+          "ingress": [{"from_port": 443, "to_port": 443, "cidr_blocks": ["0.0.0.0/0"]}]
+        }
+      }
+    },
+    {
+      "address": "aws_db_instance.prod",
+      "type": "aws_db_instance",
+      "name": "prod",
+      "change": {
+        "actions": ["delete", "create"],
+        "before": {
+          "identifier": "prod",
+          "instance_class": "db.t3.small",
+          "password": "old-secret"
+        },
+        "after": {
+          "identifier": "prod",
+          "instance_class": "db.t3.medium",
+          "password": "new-secret"
+        },
+        "before_sensitive": {"password": true},
+        "after_sensitive": {"password": true}
+      }
+    },
+    {
+      "address": "aws_iam_role.decommissioned",
+      "type": "aws_iam_role",
+      "name": "decommissioned",
+      "change": {
+        "actions": ["delete"],
+        "before": {
+          "name": "decommissioned",
+          "assume_role_policy": "{}"
+        },
+        "after": null
+      }
+    }
+  ]
+}
