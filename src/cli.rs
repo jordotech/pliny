@@ -5,8 +5,10 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(name = "pliny", version, about)]
 pub struct Args {
-    /// Path to a terraform plan JSON file (output of `terraform show -json plan.binary`)
-    pub plan_path: PathBuf,
+    /// Optional path to a terraform plan JSON file to preload
+    /// (output of `terraform show -json plan.binary`). If omitted,
+    /// pliny starts with an empty tree and waits for commands.
+    pub plan_path: Option<PathBuf>,
 
     /// Skip the AI summary call
     #[arg(long)]

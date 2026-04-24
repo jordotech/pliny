@@ -10,10 +10,14 @@ use std::time::Duration;
 const OPENAI_URL: &str = "https://api.openai.com/v1/chat/completions";
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 
-const SYSTEM_PROMPT: &str = "You are a terraform plan reviewer. Summarize the plan \
-in 2-3 sentences. Call out risky changes with 'Risky:' prefix. \
-Risky = destroys, replaces of stateful resources, security_group ingress opened to \
-0.0.0.0/0, IAM wildcards, RDS deletion_protection disabled, EBS unencrypted. Be terse.";
+const SYSTEM_PROMPT: &str = "You are a terraform plan reviewer. The first line of \
+the user message is the authoritative plan footer (e.g. 'Plan: 2 to add, 1 to change, \
+0 to destroy'). NEVER contradict these numbers or invent your own counts. Summarize \
+the plan in 2-3 sentences, quoting the footer numbers exactly. Call out risky changes \
+with a 'Risky:' prefix on a separate clause. Risky = destroys, replaces of stateful \
+resources, security_group ingress opened to 0.0.0.0/0, IAM wildcards, RDS \
+deletion_protection disabled, EBS unencrypted. If nothing is risky, say so plainly \
+instead of inventing risks. Be terse.";
 
 /// Outcome of the LLM call, ready to render in the summary pane.
 #[derive(Debug, Clone)]

@@ -49,6 +49,34 @@ pub struct Change {
     pub after_sensitive: Option<Value>,
 }
 
+/// Parsed plan footer counts, mirroring `terraform plan`'s own summary line.
+/// Replace is counted as `add + destroy` (matching terraform's convention).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ChangeCounts {
+    pub add: usize,
+    pub change: usize,
+    pub destroy: usize,
+    pub read: usize,
+    pub drift: usize,
+}
+
+impl ChangeCounts {
+    pub fn footer(&self) -> String {
+        let mut parts = vec![
+            format!("{} to add", self.add),
+            format!("{} to change", self.change),
+            format!("{} to destroy", self.destroy),
+        ];
+        if self.read > 0 {
+            parts.push(format!("{} to read", self.read));
+        }
+        if self.drift > 0 {
+            parts.push(format!("{} drifted", self.drift));
+        }
+        parts.join(", ")
+    }
+}
+
 /// High-level action derived from the `actions` array.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Action {
@@ -125,9 +153,34 @@ impl Plan {
         Ok(plan)
     }
 
-    /// Total resource changes (resource_changes + resource_drift).
+    /// Breakdown matching `terraform plan`'s "Plan: X to add, Y to change,
+    /// Z to destroy" footer. Counts only `resource_changes` entries with
+    /// non-noop actions — no-ops and drift are reported separately.
+    pub fn change_counts(&self) -> ChangeCounts {
+        let mut c = ChangeCounts::default();
+        for rc in &self.resource_changes {
+            match Action::from_actions(&rc.change.actions) {
+                Ok(Action::Create) => c.add += 1,
+                Ok(Action::Update) => c.change += 1,
+                Ok(Action::Delete) => c.destroy += 1,
+                Ok(Action::Replace) => {
+                    c.add += 1;
+                    c.destroy += 1;
+                }
+                Ok(Action::Read) => c.read += 1,
+                _ => {}
+            }
+        }
+        c.drift = self.resource_drift.len();
+        c
+    }
+
+    /// Summed count of pending plan actions. Mirrors terraform's footer
+    /// semantics — drift is NOT included here since terraform treats it
+    /// as informational, not a plan action.
     pub fn total_changes(&self) -> usize {
-        self.resource_changes.len() + self.resource_drift.len()
+        let c = self.change_counts();
+        c.add + c.change + c.destroy + c.read
     }
 
     /// True if every change is a no-op (what `terraform show -json` emits
@@ -219,6 +272,8 @@ mod tests {
         }"#;
         let p = Plan::parse(raw).unwrap();
         assert_eq!(p.resource_drift.len(), 1);
-        assert_eq!(p.total_changes(), 1);
+        // Drift is NOT counted in total_changes (matches terraform footer).
+        assert_eq!(p.total_changes(), 0);
+        assert_eq!(p.change_counts().drift, 1);
     }
 }

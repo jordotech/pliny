@@ -20,11 +20,13 @@ const SENSITIVE_PLACEHOLDER: &str = "<sensitive>";
 
 /// Produce pre-digest text from a plan + its groups.
 pub fn digest_plan(plan: &Plan, groups: &[Group]) -> String {
+    let counts = plan.change_counts();
     let total = plan.total_changes();
     let mut out = String::new();
 
     out.push_str(&format!(
-        "Plan with {total} resource change(s). {} group(s) by type/action.\n\n",
+        "Plan: {}. {} group(s) by type/action.\n\n",
+        counts.footer(),
         groups.len()
     ));
 
@@ -339,7 +341,8 @@ mod tests {
         let p = mk_plan(r#"{"format_version":"1.2","resource_changes":[]}"#);
         let g = group_plan(&p, false);
         let d = digest_plan(&p, &g);
-        assert!(d.contains("0 resource change"));
+        assert!(d.contains("0 to add"));
+        assert!(d.contains("0 to destroy"));
     }
 
     #[test]
