@@ -18,6 +18,13 @@
 //! Modes: `Normal` (j/k nav, h/l collapse-expand, `:` enters Command,
 //! `?` toggles help, q/Esc quit) and `Command` (type freeform terraform
 //! args, Enter spawns `terraform <input>`, Esc cancels).
+//!
+//! While a subprocess is running, the command bar stays visible and any
+//! text typed is forwarded to the child's stdin on Enter — this is how
+//! the user answers `terraform apply`'s "Enter a value:" prompt. Ctrl-C
+//! while running delivers SIGINT to the child (so terraform can release
+//! its state lock) instead of quitting pliny. Quitting while a child
+//! is still alive sends SIGINT first.
 
 mod tree;
 
@@ -96,6 +103,9 @@ enum Mode {
 enum RunStatus {
     Idle,
     Running,
+    /// Phase-1 plan completed, AI summary + tree refreshed. Waiting for
+    /// the user to approve or cancel the phase-2 apply.
+    AwaitingApplyConfirm,
 }
 
 struct App {
@@ -244,6 +254,50 @@ impl App {
         self.last_cmd = Some(cmd);
     }
 
+    /// Flush `cmd_buf` to the running child's stdin. Called on Enter while
+    /// a subprocess is running — this is how the user answers `terraform
+    /// apply`'s "Enter a value:" prompt.
+    fn forward_stdin_line(&mut self) {
+        if self.runner.is_none() {
+            return;
+        }
+        let line = std::mem::take(&mut self.cmd_buf);
+        // Echo what the user sent so there's a record in the output pane
+        // (terraform doesn't echo stdin).
+        self.push_output(format!("> {line}"));
+        if let Some(handle) = self.runner.as_ref() {
+            handle.send_line(line);
+        }
+    }
+
+    /// Send SIGINT to the running child. Preferred over killing pliny so
+    /// terraform gets a chance to release its state lock.
+    fn interrupt_child(&mut self) {
+        if let Some(handle) = self.runner.as_ref() {
+            handle.interrupt();
+        }
+        self.push_output("── sent SIGINT, waiting for terraform to exit ──".into());
+    }
+
+    /// Approve the phase-2 apply that's currently awaiting confirmation.
+    /// Called when the user presses 'y' during [`RunStatus::AwaitingApplyConfirm`].
+    fn approve_apply(&mut self) {
+        if let Some(handle) = self.runner.as_ref() {
+            handle.approve_apply();
+        }
+        self.push_output("pliny: approved — running apply against saved plan…".into());
+        self.status = RunStatus::Running;
+    }
+
+    /// Cancel the phase-2 apply. No terraform state is touched.
+    fn cancel_apply(&mut self) {
+        if let Some(handle) = self.runner.as_ref() {
+            handle.cancel_apply();
+        }
+        self.push_output("pliny: apply cancelled by user.".into());
+        self.status = RunStatus::Running; // Flipped back to Idle when runner emits Done.
+    }
+
     fn show_workspace_picker(&mut self) {
         self.workspaces = read_workspaces();
         self.push_output(String::new());
@@ -271,6 +325,10 @@ impl App {
         for ev in events {
             match ev {
                 RunnerEvent::Line(line) => self.push_output(line),
+                RunnerEvent::ApplyPlanReady { json_plan } => {
+                    self.ingest_plan_json(&json_plan);
+                    self.status = RunStatus::AwaitingApplyConfirm;
+                }
                 RunnerEvent::Done { exit_code, json_plan, original_cmd } => {
                     let code_str = exit_code
                         .map(|c| c.to_string())
@@ -345,8 +403,55 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, init: InitialState
             continue;
         }
 
+        // Ctrl-C semantics:
+        //   - running child             -> SIGINT to child, stay in TUI
+        //   - awaiting apply confirm    -> cancel the pending apply
+        //   - idle                      -> quit pliny
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            break;
+            match app.status {
+                RunStatus::Running => {
+                    app.interrupt_child();
+                    continue;
+                }
+                RunStatus::AwaitingApplyConfirm => {
+                    app.cancel_apply();
+                    continue;
+                }
+                RunStatus::Idle => break,
+            }
+        }
+
+        // Phase-1 plan done, awaiting y/n before phase-2 apply runs.
+        if app.status == RunStatus::AwaitingApplyConfirm {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => app.approve_apply(),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.cancel_apply(),
+                KeyCode::Down | KeyCode::Char('j') => app.move_cursor(1),
+                KeyCode::Up | KeyCode::Char('k') => app.move_cursor(-1),
+                KeyCode::Right | KeyCode::Char('l') => app.expand(),
+                KeyCode::Left | KeyCode::Char('h') => app.collapse(),
+                _ => {}
+            }
+            continue;
+        }
+
+        // While running, the subprocess owns the keyboard. Enter flushes
+        // cmd_buf to child stdin so the user can answer "yes" prompts.
+        if app.status == RunStatus::Running {
+            match key.code {
+                KeyCode::Enter => app.forward_stdin_line(),
+                KeyCode::Backspace => {
+                    app.cmd_buf.pop();
+                }
+                KeyCode::Char(c) => app.cmd_buf.push(c),
+                KeyCode::Esc => {
+                    // Treat Esc as "clear the in-flight input", not quit —
+                    // too easy to lose state lock otherwise.
+                    app.cmd_buf.clear();
+                }
+                _ => {}
+            }
+            continue;
         }
 
         match app.mode {
@@ -378,12 +483,25 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, init: InitialState
         }
     }
 
+    // If we're leaving the TUI while a child is still alive (user hit q
+    // mid-apply), SIGINT it and give it a moment to drop the state lock
+    // before we tear down the terminal.
+    if matches!(app.status, RunStatus::Running | RunStatus::AwaitingApplyConfirm) {
+        app.interrupt_child();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while app.status != RunStatus::Idle && std::time::Instant::now() < deadline {
+            app.drain_runner();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     Ok(())
 }
 
 fn render(f: &mut ratatui::Frame, app: &mut App) {
     let area = f.area();
-    let show_cmd_bar = app.mode == Mode::Command;
+    let show_cmd_bar = app.mode == Mode::Command
+        || matches!(app.status, RunStatus::Running | RunStatus::AwaitingApplyConfirm);
     let constraints: Vec<Constraint> = if show_cmd_bar {
         vec![
             Constraint::Length(8),   // context header (5 rows + borders)
@@ -427,6 +545,10 @@ fn render_header(f: &mut ratatui::Frame, area: Rect, app: &App) {
         RunStatus::Running => Span::styled(
             "running…",
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+        RunStatus::AwaitingApplyConfirm => Span::styled(
+            "confirm apply? (y/n)",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
     };
 
@@ -562,7 +684,7 @@ fn render_output(f: &mut ratatui::Frame, area: Rect, app: &App) {
         .collect();
     let title = match app.status {
         RunStatus::Running => " Output (running…) ",
-        RunStatus::Idle if app.output.is_empty() => " Output ",
+        RunStatus::AwaitingApplyConfirm => " Output (confirm apply?) ",
         RunStatus::Idle => " Output ",
     };
     let p = Paragraph::new(lines).block(Block::default().title(title).borders(Borders::ALL));
@@ -570,25 +692,42 @@ fn render_output(f: &mut ratatui::Frame, area: Rect, app: &App) {
 }
 
 fn render_command_bar(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let (prompt, prompt_color, hint_text) = match app.status {
+        RunStatus::AwaitingApplyConfirm => (
+            "apply? ",
+            Color::Red,
+            "  y = run apply against saved plan · n / Esc / Ctrl-C = cancel (no changes)",
+        ),
+        RunStatus::Running => (
+            "stdin> ",
+            Color::Yellow,
+            "  Enter sends line to terraform (e.g. `yes`) · Ctrl-C sends SIGINT",
+        ),
+        RunStatus::Idle => (
+            ":",
+            Color::Magenta,
+            "  Enter runs `terraform <input>` · Esc cancel · try: plan / apply / apply -auto-approve",
+        ),
+    };
     let content = Line::from(vec![
         Span::styled(
-            ":",
-            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            prompt,
+            Style::default().fg(prompt_color).add_modifier(Modifier::BOLD),
         ),
         Span::raw(&app.cmd_buf),
         Span::styled(
             "█",
-            Style::default().fg(Color::Magenta).add_modifier(Modifier::SLOW_BLINK),
+            Style::default().fg(prompt_color).add_modifier(Modifier::SLOW_BLINK),
         ),
     ]);
     let hint = Line::from(Span::styled(
-        "  Enter runs `terraform <input>` · Esc cancel · try: plan / plan -refresh=false / apply -auto-approve",
+        hint_text,
         Style::default().fg(Color::DarkGray),
     ));
     let p = Paragraph::new(vec![content, hint]).block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Magenta)),
+            .border_style(Style::default().fg(prompt_color)),
     );
     f.render_widget(p, area);
 }

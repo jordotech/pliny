@@ -886,6 +886,7 @@ dependencies = [
  "clap",
  "crossterm",
  "insta",
+ "libc",
  "ratatui",
  "reqwest",
  "serde",
